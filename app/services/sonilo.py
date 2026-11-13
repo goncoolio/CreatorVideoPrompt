@@ -11,6 +11,8 @@ from typing import Any
 import requests
 from loguru import logger
 
+from app.utils.request_logging import trace_http_call
+
 from app.config import config
 from app.services import bgm as bgm_service
 from app.utils import utils
@@ -23,6 +25,10 @@ MAX_VIDEO_DURATION_SECONDS = 360
 MAX_PROMPT_LENGTH = 2000
 MAX_PROXY_BYTES = 300 * 1024 * 1024
 MAX_GENERATED_AUDIO_BYTES = 30 * 1024 * 1024
+MAX_ERROR_BODY_BYTES = 500
+# One event can hold the full permitted audio as base64, plus JSON metadata.
+MAX_STREAM_EVENT_BYTES = 4 * ((MAX_GENERATED_AUDIO_BYTES + 2) // 3) + 64 * 1024
+_STREAM_READ_BYTES = 64 * 1024
 VIDEO_TO_MUSIC_SERVICE_ID = "video_to_music"
 
 
@@ -74,8 +80,29 @@ def _normalize_service_id(service_id: str) -> str:
 
 
 def _safe_response_error(response: requests.Response) -> str:
-    """仅保留简短响应信息，既方便定位又避免异常页面污染日志。"""
-    body = (response.text or "").strip().replace("\n", " ")[:500]
+    """只读取有限的第三方错误正文，避免异常响应耗尽内存或污染任务日志。"""
+    try:
+        body_bytes = next(
+            response.iter_content(chunk_size=MAX_ERROR_BODY_BYTES),
+            b"",
+        )
+    except requests.RequestException:
+        body_bytes = b""
+    if isinstance(body_bytes, bytes):
+        try:
+            body = body_bytes.decode(
+                response.encoding or "utf-8",
+                errors="replace",
+            )
+        except LookupError:
+            # response.encoding 直接取自上游声明的 charset，未知取值（例如
+            # charset=unknown-charset）会让 codecs 抛 LookupError，而 errors
+            # 只影响 UnicodeDecodeError。旧的 response.text 会在内部退回
+            # UTF-8，这里保持同样行为，避免该异常绕过调用方的 Sonilo 降级链路。
+            body = body_bytes.decode("utf-8", errors="replace")
+    else:
+        body = str(body_bytes)
+    body = body.strip().replace("\n", " ")[:MAX_ERROR_BODY_BYTES]
     return body or response.reason or "request failed"
 
 
@@ -89,22 +116,32 @@ def test_connection() -> dict[str, Any]:
     if not api_key:
         raise SoniloError("Sonilo API key is required")
     try:
-        response = requests.get(
+        with trace_http_call(
+            "GET", requests.get,
             f"{_base_url()}{SERVICES_PATH}",
             headers={"Authorization": f"Bearer {api_key}"},
             timeout=(15, 30),
-        )
+            stream=True,
+            allow_redirects=False,
+        ) as response:
+            if 300 <= response.status_code < 400:
+                raise SoniloError(
+                    "Sonilo connection check returned a redirect; "
+                    "the API key was not forwarded"
+                )
+            if not response.ok:
+                raise SoniloError(
+                    f"Sonilo connection failed ({response.status_code}): "
+                    f"{_safe_response_error(response)}"
+                )
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                raise SoniloError(
+                    "Sonilo returned an invalid service response"
+                ) from exc
     except requests.RequestException as exc:
         raise SoniloError(f"failed to connect to Sonilo: {exc}") from exc
-    if not response.ok:
-        raise SoniloError(
-            f"Sonilo connection failed ({response.status_code}): "
-            f"{_safe_response_error(response)}"
-        )
-    try:
-        payload = response.json()
-    except ValueError as exc:
-        raise SoniloError("Sonilo returned an invalid service response") from exc
     if not isinstance(payload, dict):
         raise SoniloError("Sonilo returned an unexpected service response")
     available_services = payload.get("available_services")
@@ -170,6 +207,8 @@ def _create_video_proxy(video_path: str) -> str:
         "yuv420p",
         "-movflags",
         "+faststart",
+        "-fs",
+        str(MAX_PROXY_BYTES),
         proxy_path,
     ]
     try:
@@ -177,6 +216,8 @@ def _create_video_proxy(video_path: str) -> str:
             command,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=600,
             check=False,
         )
@@ -198,6 +239,27 @@ def _create_video_proxy(video_path: str) -> str:
         f"Sonilo video proxy prepared: source={video_path}, size={proxy_size} bytes"
     )
     return proxy_path
+
+
+def _iter_bounded_events(response: requests.Response):
+    """Read NDJSON without Requests' unbounded unterminated-line buffer."""
+    pending = bytearray()
+    for chunk in response.iter_content(chunk_size=_STREAM_READ_BYTES):
+        if not chunk:
+            continue
+        # Split only the bounded transport chunk; never concatenate an
+        # oversized line before checking its accumulated size.
+        pieces = chunk.split(b"\n")
+        for index, piece in enumerate(pieces):
+            if len(pending) + len(piece) > MAX_STREAM_EVENT_BYTES:
+                raise SoniloError("Sonilo streaming event exceeds the size limit")
+            pending.extend(piece)
+            if index < len(pieces) - 1:
+                if pending:
+                    yield bytes(pending).rstrip(b"\r")
+                pending.clear()
+    if pending:
+        yield bytes(pending).rstrip(b"\r")
 
 
 def _parse_event(raw_line: bytes) -> dict[str, Any]:
@@ -222,7 +284,7 @@ def _stream_audio(response: requests.Response, temp_audio_path: str) -> tuple[in
     title = ""
     completed = False
     with open(temp_audio_path, "wb") as output:
-        for raw_line in response.iter_lines():
+        for raw_line in _iter_bounded_events(response):
             if not raw_line:
                 continue
             event = _parse_event(raw_line)
@@ -285,15 +347,22 @@ def _request_bgm(video_path: str, output_path: str, prompt: str) -> str:
         )
         try:
             with open(video_path, "rb") as video_file:
-                response = requests.post(
+                response = trace_http_call(
+                    "POST", requests.post,
                     f"{_base_url()}{VIDEO_TO_MUSIC_PATH}",
                     headers={"Authorization": f"Bearer {get_api_key()}"},
                     files={"video": (Path(video_path).name, video_file, "video/mp4")},
                     data={"prompt": prompt} if prompt else None,
                     stream=True,
                     timeout=_request_timeout(),
+                    allow_redirects=False,
                 )
                 with response:
+                    if 300 <= response.status_code < 400:
+                        raise SoniloError(
+                            "Sonilo generation returned a redirect; "
+                            "the video and API key were not forwarded"
+                        )
                     if not response.ok:
                         raise SoniloError(
                             f"Sonilo generation failed ({response.status_code}): "

@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 import urllib.error
 import urllib.request
 import uuid
@@ -24,17 +25,32 @@ PROJECT_ARCHIVE_URL = (
 )
 DEFAULT_ROOT = Path.home() / "MoneyPrinterTurbo"
 DEFAULT_VOICE_NAME = "zh-CN-XiaoxiaoNeural-Female"
+DEFAULT_UV_LOCK_TIMEOUT = "1200"
 NEEDS_INPUT_EXIT_CODE = 10
 SUPPORTED_SOURCES = {
     "pexels",
     "pixabay",
     "coverr",
+    "wavespeed",
     "volcengine_seedance",
+    "ofox",
+    "metaso_minimax",
+    "muapi",
+    "infistar",
+    "jalapeno",
+    # Keep this list aligned with ``_CLI_VIDEO_SOURCES`` in cli.py. A source that
+    # the CLI accepts must not be rejected here as unsupported.
+    "openai_image",
+    "codex_image",
     "local",
 }
 VOLCENGINE_ARK_API_KEY_URL = (
     "https://console.volcengine.com/ark/region:ark+cn-beijing/apikey"
 )
+OFOX_API_KEY_URL = "https://ofox.ai"
+MUAPI_API_KEY_URL = "https://muapi.ai"
+INFISTAR_VIDEO_API_KEY_URL = "https://infistar.cc/keys"
+JALAPENO_API_KEY_URL = "https://www.jalapeno-cloud.ai/MoneyPrinterTurbo"
 PEXELS_API_KEY_URL = "https://www.pexels.com/api/"
 PEXELS_VALIDATION_URL = "https://api.pexels.com/v1/collections?per_page=1"
 PEXELS_API_KEY_HELP_URL = (
@@ -47,7 +63,7 @@ PEXELS_API_KEY_HELP_URL = (
 RECOMMENDED_LLM_PROVIDERS = {
     "moonshot": (
         "Kimi / Moonshot AI",
-        "https://platform.kimi.com?track_id=track-2f5441d6ffd84c509dd079d78e9db5dc&aff=moneyprinterturbo",
+        "https://platform.kimi.com?track_id=track-6eec1e56a4494e52adcaebbcbbefce59&aff=moneyprinterturbo",
     ),
     "openai": ("OpenAI", "https://platform.openai.com/api-keys"),
     "gemini": ("Google Gemini", "https://aistudio.google.com/app/apikey"),
@@ -62,7 +78,18 @@ RECOMMENDED_LLM_PROVIDERS = {
         "https://platform.xiaomimimo.com/docs/zh-CN/quick-start/first-api-call",
     ),
 }
-KEYLESS_LLM_PROVIDERS = {"ollama", "litellm"}
+# Providers that generate without an API key stored in config.toml: Ollama talks
+# to a local server, LiteLLM resolves credentials through its own environment,
+# ``claude_code`` consumes the Claude subscription through the locally
+# logged-in ``claude`` CLI, and ``kimi_code`` consumes the Kimi Code plan
+# through the OAuth credentials the WebUI sign-in stores in config.toml.
+# ``openai_codex`` and ``openai_chatgpt`` use separate local credential files.
+# Keep this set aligned with the ``requires_api_key=False`` entries of
+# ``app/models/llm_provider.py``; asking the user for a key that the provider
+# never reads leaves the Skill stuck.
+KEYLESS_LLM_PROVIDERS = {
+    "ollama", "litellm", "claude_code", "kimi_code", "openai_codex", "openai_chatgpt"
+}
 CUSTOM_OPENAI_PROVIDER = "oneapi"
 
 # Hidden providers such as Qwen, Azure, and Grok remain usable when already
@@ -163,23 +190,41 @@ def ensure_config(root: Path) -> Path:
 
 
 def _plain_config_value(text: str, key: str) -> str:
-    """Read a simple top-level TOML value without printing its contents."""
-    match = re.search(rf"(?m)^{re.escape(key)}\s*=\s*(.*)$", text)
-    if not match:
-        return ""
-    value = match.group(1).split("#", 1)[0].strip()
-    if value.startswith('"') and value.endswith('"'):
-        return value[1:-1]
-    return value
+    """Read app settings with the same TOML syntax as the backend loader."""
+    try:
+        document = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        # Configuration can contain credentials; do not echo its source text.
+        raise SkillError("configuration is not valid TOML") from exc
+    settings = document.get("app", document)
+    if not isinstance(settings, dict):
+        raise SkillError("configuration app settings must be a TOML table")
+    value = settings.get(key, "")
+    # Existing readiness/list consumers expect an unquoted string or JSON array.
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False)
 
 
 def _replace_config_value(text: str, key: str, value: object) -> str:
     """Replace one active field while preserving the configuration layout."""
     pattern = re.compile(rf"(?m)^({re.escape(key)}\s*=\s*).*$")
-    if not pattern.search(text):
+    match = pattern.search(text)
+    if match is None:
         raise SkillError(f"configuration field not found in config.toml: {key}")
+    value_start = match.start() + len(match.group(1))
+    value_end = match.end()
+    while True:
+        try:
+            tomllib.loads("replacement = " + text[value_start:value_end])
+            break
+        except tomllib.TOMLDecodeError as exc:
+            next_line = text.find("\n", value_end + 1)
+            if value_end == len(text):
+                raise SkillError("configuration field is not valid TOML") from exc
+            value_end = len(text) if next_line < 0 else next_line
     encoded = json.dumps(value, ensure_ascii=False)
-    return pattern.sub(lambda match: f"{match.group(1)}{encoded}", text, count=1)
+    return text[:value_start] + encoded + text[value_end:]
 
 
 def _has_configured_value(value: str) -> bool:
@@ -216,11 +261,32 @@ def apply_environment_config(config_path: Path) -> None:
     model_name = os.environ.get("MPT_LLM_MODEL_NAME", "").strip()
     pexels_key = os.environ.get("MPT_PEXELS_API_KEY", "").strip()
     seedance_key = os.environ.get("MPT_VOLCENGINE_ARK_API_KEY", "").strip()
-    if not any((provider, llm_key, base_url, model_name, pexels_key, seedance_key)):
+    ofox_key = os.environ.get("MPT_OFOX_API_KEY", "").strip()
+    metaso_minimax_key = os.environ.get(
+        "MPT_METASO_MINIMAX_API_KEY", ""
+    ).strip()
+    muapi_key = os.environ.get("MPT_MUAPI_API_KEY", "").strip()
+    infistar_video_key = os.environ.get("MPT_INFISTAR_VIDEO_API_KEY", "").strip()
+    jalapeno_video_key = os.environ.get("MPT_JALAPENO_VIDEO_API_KEY", "").strip()
+    if not any(
+        (
+            provider,
+            llm_key,
+            base_url,
+            model_name,
+            pexels_key,
+            seedance_key,
+            ofox_key,
+            metaso_minimax_key,
+            muapi_key,
+            infistar_video_key,
+            jalapeno_video_key,
+        )
+    ):
         return
 
     text = config_path.read_text(encoding="utf-8")
-    current_provider = _plain_config_value(text, "llm_provider") or "moonshot"
+    current_provider = (_plain_config_value(text, "llm_provider") or "moonshot").lower()
     provider = provider or current_provider
     changes: list[str] = []
     if os.environ.get("MPT_LLM_PROVIDER", "").strip():
@@ -243,12 +309,36 @@ def apply_environment_config(config_path: Path) -> None:
             text, "volcengine_seedance_api_key", seedance_key
         )
         changes.append("volcengine_seedance_api_key")
+    if ofox_key:
+        text = _replace_config_value(text, "ofox_api_key", ofox_key)
+        changes.append("ofox_api_key")
+    if metaso_minimax_key:
+        text = _replace_config_value(
+            text, "metaso_minimax_api_key", metaso_minimax_key
+        )
+        changes.append("metaso_minimax_api_key")
+    if muapi_key:
+        text = _replace_config_value(text, "muapi_api_key", muapi_key)
+        changes.append("muapi_api_key")
+    if infistar_video_key:
+        text = _replace_config_value(text, "infistar_video_api_key", infistar_video_key)
+        changes.append("infistar_video_api_key")
+    if jalapeno_video_key:
+        text = _replace_config_value(text, "jalapeno_video_api_key", jalapeno_video_key)
+        changes.append("jalapeno_video_api_key")
     config_path.write_text(text, encoding="utf-8")
     log("updated configuration fields: " + ", ".join(changes))
 
 
 def _provider_is_ready(text: str, provider: str) -> bool:
     """Return whether a provider has enough configuration to generate."""
+    if provider == "kimi_code":
+        # 不需要 API Key，但需要 WebUI「使用 Kimi 登录」后写入的 OAuth 凭证；
+        # 没有凭证时不能当作就绪，否则生成会在运行时才报未授权。
+        return any(
+            _has_configured_value(_plain_config_value(text, field))
+            for field in ("kimi_code_refresh_token", "kimi_code_access_token")
+        )
     if provider in KEYLESS_LLM_PROVIDERS:
         return True
     if not _has_configured_value(
@@ -272,7 +362,7 @@ def reuse_existing_llm_provider(config_path: Path) -> str:
     values are inspected in memory and are never logged.
     """
     text = config_path.read_text(encoding="utf-8")
-    current_provider = _plain_config_value(text, "llm_provider") or "moonshot"
+    current_provider = (_plain_config_value(text, "llm_provider") or "moonshot").lower()
     if _provider_is_ready(text, current_provider):
         return current_provider
 
@@ -291,12 +381,13 @@ def reuse_existing_llm_provider(config_path: Path) -> str:
 
 def selected_video_source(cli_args: list[str]) -> str:
     """Read the effective material source from forwarded CLI arguments."""
+    source = "pexels"
     for index, item in enumerate(cli_args):
         if item == "--video-source" and index + 1 < len(cli_args):
-            return cli_args[index + 1].strip().lower()
+            source = cli_args[index + 1].strip().lower()
         if item.startswith("--video-source="):
-            return item.split("=", 1)[1].strip().lower()
-    return "pexels"
+            source = item.split("=", 1)[1].strip().lower()
+    return source
 
 
 def has_cli_option(cli_args: list[str], option: str) -> bool:
@@ -304,16 +395,38 @@ def has_cli_option(cli_args: list[str], option: str) -> bool:
     return any(item == option or item.startswith(f"{option}=") for item in cli_args)
 
 
+def _last_cli_value(cli_args: list[str], option: str) -> str:
+    value = ""
+    for index, item in enumerate(cli_args):
+        if item == option and index + 1 < len(cli_args):
+            value = cli_args[index + 1]
+        elif item.startswith(f"{option}="):
+            value = item.split("=", 1)[1]
+    return value.strip()
+
+
+def _requires_llm(cli_args: list[str]) -> bool:
+    # Match task.generate_script and the local-material terms bypass.
+    return not _last_cli_value(cli_args, "--video-script") or (
+        selected_video_source(cli_args) != "local"
+        and not _last_cli_value(cli_args, "--video-terms")
+    )
+
+
 def missing_config(config_path: Path, cli_args: list[str]) -> tuple[str, list[str]]:
     """Return the active provider and only the fields required by this run."""
     text = config_path.read_text(encoding="utf-8")
-    provider = _plain_config_value(text, "llm_provider") or "moonshot"
+    provider = (_plain_config_value(text, "llm_provider") or "moonshot").lower()
     missing: list[str] = []
-    if provider not in KEYLESS_LLM_PROVIDERS and not _has_configured_value(
+    needs_llm = _requires_llm(cli_args)
+    if needs_llm and provider not in KEYLESS_LLM_PROVIDERS and not _has_configured_value(
         _plain_config_value(text, f"{provider}_api_key")
     ):
         missing.append(f"{provider}_api_key")
-    if provider == CUSTOM_OPENAI_PROVIDER:
+    if needs_llm and provider == "kimi_code" and not _provider_is_ready(text, provider):
+        # 无 Key 可填，缺失的是 WebUI 登录动作而不是配置字段。
+        missing.append("kimi_code_sign_in")
+    if needs_llm and provider == CUSTOM_OPENAI_PROVIDER:
         for suffix in ("base_url", "model_name"):
             field = f"{provider}_{suffix}"
             if not _has_configured_value(_plain_config_value(text, field)):
@@ -322,18 +435,100 @@ def missing_config(config_path: Path, cli_args: list[str]) -> tuple[str, list[st
     source = selected_video_source(cli_args)
     if source not in SUPPORTED_SOURCES:
         raise SkillError(f"unsupported video source: {source}")
+    if source == "local" and not has_cli_option(cli_args, "--video-materials"):
+        raise SkillError(
+            "Local video source requires --video-materials pointing to a "
+            "directory of video files"
+        )
     if source == "volcengine_seedance":
         # 与运行时 Provider 保持完全一致的凭据优先级，避免 Skill 预检通过后
         # 主程序却读取了另一把 Key。ARK_API_KEY 语义过于宽泛，明确不再兼容。
         value = (
-            _plain_config_value(text, "volcengine_seedance_api_key")
+            _plain_config_value(text, "volcengine_seedance_api_key").strip()
             or os.environ.get("VOLCENGINE_ARK_API_KEY", "").strip()
-            or _plain_config_value(text, "volcengine_api_key")
+            or _plain_config_value(text, "volcengine_api_key").strip()
         )
         if not _has_configured_value(value):
             missing.append("volcengine_seedance_api_key")
         if not has_cli_option(cli_args, "--confirm-seedance-charge"):
             missing.append("confirm_seedance_charge")
+    elif source == "wavespeed":
+        # WaveSpeed 的运行时凭据只来自 wavespeed_api_keys，没有环境变量回退，
+        # 这里保持同一口径。按次计费的生成源还必须显式确认收费。
+        if not _has_configured_value(
+            _plain_config_value(text, "wavespeed_api_keys")
+        ):
+            missing.append("wavespeed_api_keys")
+        if not has_cli_option(cli_args, "--confirm-wavespeed-charge"):
+            missing.append("confirm_wavespeed_charge")
+    elif source == "ofox":
+        # 与运行时 Provider 保持完全一致的凭据优先级：配置键优先，其次是
+        # 语义明确的 OFOX_API_KEY 环境变量。
+        value = (
+            _plain_config_value(text, "ofox_api_key").strip()
+            or os.environ.get("OFOX_API_KEY", "").strip()
+        )
+        if not _has_configured_value(value):
+            missing.append("ofox_api_key")
+        if not has_cli_option(cli_args, "--confirm-ofox-charge"):
+            missing.append("confirm_ofox_charge")
+    elif source == "metaso_minimax":
+        # 秘塔 Key 与 MiniMax 官方 LLM Key 不互通，Skill 必须沿用运行时的
+        # 独立配置优先级，不能因为已经配置 minimax_api_key 就误判为可用。
+        value = (
+            _plain_config_value(text, "metaso_minimax_api_key").strip()
+            or os.environ.get("METASO_MINIMAX_API_KEY", "").strip()
+        )
+        if not _has_configured_value(value):
+            missing.append("metaso_minimax_api_key")
+        if not has_cli_option(cli_args, "--confirm-metaso-minimax-charge"):
+            missing.append("confirm_metaso_minimax_charge")
+    elif source == "muapi":
+        value = (
+            _plain_config_value(text, "muapi_api_key").strip()
+            or os.environ.get("MUAPI_API_KEY", "").strip()
+        )
+        if not _has_configured_value(value):
+            missing.append("muapi_api_key")
+        if not has_cli_option(cli_args, "--confirm-muapi-charge"):
+            missing.append("confirm_muapi_charge")
+    elif source == "infistar":
+        # 视频凭据独立于同品牌 LLM，预检必须与 infistar_video.get_api_key 一致。
+        value = (
+            _plain_config_value(text, "infistar_video_api_key").strip()
+            or os.environ.get("INFISTAR_VIDEO_API_KEY", "").strip()
+        )
+        if not _has_configured_value(value):
+            missing.append("infistar_video_api_key")
+        if not has_cli_option(cli_args, "--confirm-infistar-charge"):
+            missing.append("confirm_infistar_charge")
+    elif source == "jalapeno":
+        value = (
+            _plain_config_value(text, "jalapeno_video_api_key").strip()
+            or os.environ.get("JALAPENO_VIDEO_API_KEY", "").strip()
+            or _plain_config_value(text, "jalapeno_api_key").strip()
+        )
+        # 同时缺少 LLM 和视频凭据时，只索取一次可共享的大模型 Key。
+        if not _has_configured_value(value) and "jalapeno_api_key" not in missing:
+            missing.append("jalapeno_video_api_key")
+        if not has_cli_option(cli_args, "--confirm-jalapeno-charge"):
+            missing.append("confirm_jalapeno_charge")
+    elif source == "codex_image":
+        if not _has_configured_value(_plain_config_value(text, "codex_image_model_name")):
+            missing.append("codex_image_model_name")
+        # This bootstrap helper runs without application dependencies. Presence
+        # is only a hint; the runtime validates/decrypts the shared session.
+        runtime_root = Path(os.environ.get("MPT_HOME") or config_path.parent)
+        connected = (runtime_root / "storage" / "auth" / "openai_codex.bin").is_file()
+        if not connected:
+            missing.append("codex_sign_in")
+    elif source == "openai_image":
+        # 与运行时的 is_openai_image_enabled() 保持一致：文生图素材源只要求端点
+        # 与模型名。完全本地的 ComfyUI/SD 网关允许不配置 API Key，因此这里不
+        # 能把 openai_image_api_keys 当作必填项。
+        for field in ("openai_image_base_url", "openai_image_model"):
+            if not _has_configured_value(_plain_config_value(text, field)):
+                missing.append(field)
     elif source != "local":
         value = _plain_config_value(text, f"{source}_api_keys")
         if not _has_configured_value(value):
@@ -349,7 +544,14 @@ def report_missing_config(provider: str, missing: list[str]) -> int:
         print(f"MISSING={field}")
     if any(
         field.endswith("_api_key")
-        and field != "volcengine_seedance_api_key"
+        and field not in {
+            "volcengine_seedance_api_key",
+            "ofox_api_key",
+            "metaso_minimax_api_key",
+            "muapi_api_key",
+            "infistar_video_api_key",
+            "jalapeno_video_api_key",
+        }
         for field in missing
     ):
         print("LLM_PROVIDER_OPTIONS_BEGIN")
@@ -365,14 +567,57 @@ def report_missing_config(provider: str, missing: list[str]) -> int:
             "OPENAI_COMPATIBLE_REQUIRED="
             "API key, API base URL, model name"
         )
+    if any(field.startswith("openai_image_") for field in missing):
+        print(
+            "OPENAI_IMAGE_REQUIRED="
+            "openai_image_base_url, openai_image_model (the API key is optional "
+            "for local gateways)"
+        )
+    if "codex_sign_in" in missing:
+        print("CODEX_SIGN_IN_REQUIRED=Open Codex account settings in the WebUI and sign in once for text and images")
     if "pexels_api_keys" in missing:
         print(f"PEXELS_API_KEY_URL={PEXELS_API_KEY_URL}")
         print(f"PEXELS_API_KEY_HELP_URL={PEXELS_API_KEY_HELP_URL}")
+    if "kimi_code_sign_in" in missing:
+        print(
+            "KIMI_CODE_SIGN_IN_REQUIRED="
+            "open Settings -> LLM Settings and sign in with Kimi"
+        )
     if "volcengine_seedance_api_key" in missing:
         print(f"VOLCENGINE_ARK_API_KEY_URL={VOLCENGINE_ARK_API_KEY_URL}")
         print("VOLCENGINE_ARK_API_KEY_ENV=MPT_VOLCENGINE_ARK_API_KEY")
     if "confirm_seedance_charge" in missing:
         print("SEEDANCE_CHARGE_CONFIRMATION_REQUIRED=--confirm-seedance-charge")
+    if "confirm_wavespeed_charge" in missing:
+        print("WAVESPEED_CHARGE_CONFIRMATION_REQUIRED=--confirm-wavespeed-charge")
+    if "ofox_api_key" in missing:
+        print(f"OFOX_API_KEY_URL={OFOX_API_KEY_URL}")
+        print("OFOX_API_KEY_ENV=MPT_OFOX_API_KEY")
+    if "confirm_ofox_charge" in missing:
+        print("OFOX_CHARGE_CONFIRMATION_REQUIRED=--confirm-ofox-charge")
+    if "metaso_minimax_api_key" in missing:
+        print("METASO_MINIMAX_API_KEY_ENV=MPT_METASO_MINIMAX_API_KEY")
+    if "confirm_metaso_minimax_charge" in missing:
+        print(
+            "METASO_MINIMAX_CHARGE_CONFIRMATION_REQUIRED="
+            "--confirm-metaso-minimax-charge"
+        )
+    if "muapi_api_key" in missing:
+        print(f"MUAPI_API_KEY_URL={MUAPI_API_KEY_URL}")
+        print("MUAPI_API_KEY_ENV=MPT_MUAPI_API_KEY")
+    if "confirm_muapi_charge" in missing:
+        print("MUAPI_CHARGE_CONFIRMATION_REQUIRED=--confirm-muapi-charge")
+    if "infistar_video_api_key" in missing:
+        print(f"INFISTAR_VIDEO_API_KEY_URL={INFISTAR_VIDEO_API_KEY_URL}")
+        print("INFISTAR_VIDEO_API_KEY_ENV=MPT_INFISTAR_VIDEO_API_KEY")
+    if "confirm_infistar_charge" in missing:
+        print("INFISTAR_CHARGE_CONFIRMATION_REQUIRED=--confirm-infistar-charge")
+    if "jalapeno_video_api_key" in missing or "jalapeno_api_key" in missing:
+        print(f"JALAPENO_API_KEY_URL={JALAPENO_API_KEY_URL}")
+    if "jalapeno_video_api_key" in missing:
+        print("JALAPENO_VIDEO_API_KEY_ENV=MPT_JALAPENO_VIDEO_API_KEY")
+    if "confirm_jalapeno_charge" in missing:
+        print("JALAPENO_CHARGE_CONFIRMATION_REQUIRED=--confirm-jalapeno-charge")
     print("Request only the listed values, set the environment variables, and rerun the same command.")
     return NEEDS_INPUT_EXIT_CODE
 
@@ -391,8 +636,8 @@ def _validate_pexels_key(api_key: str) -> str:
     """
     Return ``valid``, ``rejected``, or ``unknown`` for a Pexels key.
 
-    HTTP 401, 403, and rate-limited 429 responses make a key unusable for this
-    run. Network and server errors return unknown so the configuration is kept.
+    HTTP 401 and 403 responses reject credentials. Rate limits, network and
+    server errors return unknown so temporary failures cannot remove a key.
     """
     # Curated and popular search requests may hit a public cache and return 200
     # without valid authorization. My Collections is account-specific, requires
@@ -408,7 +653,7 @@ def _validate_pexels_key(api_key: str) -> str:
         with urllib.request.urlopen(request, timeout=15) as response:
             return "valid" if 200 <= response.status < 300 else "unknown"
     except urllib.error.HTTPError as exc:
-        if exc.code in {401, 403, 429}:
+        if exc.code in {401, 403}:
             return "rejected"
         return "unknown"
     except (TimeoutError, urllib.error.URLError):
@@ -421,7 +666,7 @@ def validate_pexels_config(config_path: Path, cli_args: list[str]) -> bool:
 
     Downstream code selects configured keys randomly. Keeping rejected keys can
     cause intermittent 401 responses and missing material results. If at least
-    one key is verified, retain only verified keys. If validation is impossible
+    one key is verified, remove only explicitly rejected keys. If validation is impossible
     because of a transient network failure, keep the original configuration.
     """
     if selected_video_source(cli_args) != "pexels":
@@ -433,20 +678,23 @@ def validate_pexels_config(config_path: Path, cli_args: list[str]) -> bool:
         return False
 
     valid_keys: list[str] = []
+    retained_keys: list[str] = []
     rejected_count = 0
     unknown_count = 0
     for api_key in keys:
         status = _validate_pexels_key(api_key)
         if status == "valid":
             valid_keys.append(api_key)
+            retained_keys.append(api_key)
         elif status == "rejected":
             rejected_count += 1
         else:
             unknown_count += 1
+            retained_keys.append(api_key)
 
     if valid_keys:
-        if valid_keys != keys:
-            text = _replace_config_value(text, "pexels_api_keys", valid_keys)
+        if retained_keys != keys:
+            text = _replace_config_value(text, "pexels_api_keys", retained_keys)
             config_path.write_text(text, encoding="utf-8")
         log(
             "Pexels key validation completed: "
@@ -491,14 +739,20 @@ def write_result_manifest(root: Path, payload: dict[str, object]) -> Path:
 
 
 def run_checked(command: list[str], *, cwd: Path) -> None:
-    """Run dependency sync quietly and show only the last 30 lines on failure."""
+    """延长首次安装的缓存锁等待，失败时保留末尾日志和排查提示。"""
     log("installing or verifying project dependencies with uv")
+    # 多个安装进程可能共享较大的 wheel 缓存；只给子进程设置默认值，
+    # 保留用户覆盖及其他环境变量，不改变当前进程或视频生成子进程的环境。
+    sync_env = os.environ.copy()
+    sync_env.setdefault("UV_LOCK_TIMEOUT", DEFAULT_UV_LOCK_TIMEOUT)
     result = subprocess.run(
         command,
         cwd=cwd,
+        env=sync_env,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        encoding="utf-8",
         errors="replace",
         check=False,
     )
@@ -506,6 +760,14 @@ def run_checked(command: list[str], *, cwd: Path) -> None:
         output_tail = (result.stdout or "").splitlines()[-30:]
         if output_tail:
             print("\n".join(output_tail), file=sys.stderr)
+        output = (result.stdout or "").lower()
+        if "lock" in output and ("timeout" in output or "timed out" in output):
+            print(
+                "uv timed out waiting for a cache lock. Wait for other uv installs "
+                "to finish, then retry. If needed, increase UV_LOCK_TIMEOUT "
+                "(requires uv 0.9.4 or newer).",
+                file=sys.stderr,
+            )
         raise SkillError(f"dependency installation failed with exit code {result.returncode}")
 
 
@@ -562,15 +824,31 @@ def generate_video(
     ]
     log(f"starting video generation, task ID: {task_id}")
     log(f"full generation log: {log_path}")
-    with log_path.open("w", encoding="utf-8") as log_file:
-        result = subprocess.run(
-            command,
-            cwd=root,
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            text=True,
-            check=False,
+    try:
+        with log_path.open("w", encoding="utf-8") as log_file:
+            result = subprocess.run(
+                command,
+                cwd=root,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+            )
+    except OSError as exc:
+        error = f"video generation could not start: {exc}; log: {log_path}"
+        write_result_manifest(
+            root,
+            {
+                "status": "failed",
+                "subject": subject,
+                "task_id": task_id,
+                "task_dir": str(task_dir.resolve()),
+                "log_file": str(log_path.resolve()),
+                "video_files": [],
+                "error": error,
+            },
         )
+        raise SkillError(error) from exc
     if result.returncode != 0:
         tail = log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-30:]
         if tail:

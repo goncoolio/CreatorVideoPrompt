@@ -1,4 +1,5 @@
 import errno
+import re
 import threading
 import time
 import tomllib
@@ -7,6 +8,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import toml
+import pytest
 
 from app.config import config
 from app.models.llm_provider import LLM_PROVIDER_REGISTRY, get_llm_provider
@@ -42,6 +44,9 @@ class TestConfigPersistence:
             "pixabay",
             "coverr",
             "volcengine_seedance",
+            "ofox",
+            "metaso_minimax",
+            "muapi",
             "loomloom",
             "local",
         }
@@ -52,9 +57,37 @@ class TestConfigPersistence:
         assert app_config["volcengine_seedance_api_key"] == ""
         assert app_config["volcengine_seedance_base_url"].startswith("https://")
         assert app_config["volcengine_seedance_model"]
+        assert app_config["ofox_api_key"] == ""
+        assert app_config["ofox_base_url"].startswith("https://")
+        assert app_config["ofox_text_to_video_model"]
+        assert app_config["metaso_minimax_api_key"] == ""
+        assert app_config["metaso_minimax_base_url"].startswith("https://")
+        assert app_config["metaso_minimax_resolution"] in {"768P", "2K"}
+        assert app_config["muapi_api_key"] == ""
+        assert app_config["muapi_base_url"].startswith("https://")
+        assert app_config["muapi_video_endpoint"]
+        assert app_config["muapi_resolution"]
+        assert app_config["muapi_min_duration"] == 3
+        assert app_config["muapi_max_duration"] == 12
         assert "loomloom_market_listing_id" not in app_config
         assert "loomloom_video_market_listing_id" not in app_config
         assert app_config["shengsuanyun_api_key"] == ""
+        assert example_config["voxcpm"] == {
+            "base_url": "https://api.modelbest.cn/v1",
+            "api_key": "",
+            "model_id": "",
+            "voice_id": "default",
+        }
+        # Video-to-Music reads music_base_url from [elevenlabs] and, unlike the
+        # API key, it has no environment-variable fallback: if the example omits
+        # it there is no documented way to route the endpoint through a proxy.
+        assert example_config["elevenlabs"] == {
+            "api_key": "",
+            "model_id": "eleven_multilingual_v2",
+            "music_base_url": "https://api.elevenlabs.io",
+            "music_model_id": "music_v2",
+            "music_timeout": 600,
+        }
         assert example_config["whisper"]["device"] == "cpu"
 
     def test_example_config_covers_llm_provider_registry(self):
@@ -70,6 +103,33 @@ class TestConfigPersistence:
                 assert provider.config_key("model_name") in app_config
             for field in provider.extra_fields:
                 assert provider.config_key(field.config_suffix) in app_config
+
+    def test_example_ui_block_documents_every_pinnable_default(self):
+        """[ui] 注释块必须列出代码真正会从 [ui] 读取的每个键。
+
+        该块是用户手工固定初始默认值的唯一入口，因此只列出部分键会让设置
+        静默失效：用户照着示例写了 [ui].subtitle_display_mode，却因为示例
+        没提而根本不知道它存在。断言从源码里推导，新增可固定字段时会先失败。
+        """
+        project_root = Path(__file__).resolve().parents[2]
+        ui_block = (project_root / "config.example.toml").read_text(
+            encoding="utf-8"
+        ).split("[ui]", 1)[1]
+        documented = set(re.findall(r"^#\s*([a-z_]+)\s*=", ui_block, re.MULTILINE))
+
+        schema_text = (project_root / "app/models/schema.py").read_text(
+            encoding="utf-8"
+        )
+        pinnable = set(re.findall(r'config\.ui\.get\(\s*"([a-z_]+)"', schema_text))
+        pinnable |= set(
+            re.findall(r'_get_valid_ui_choice\(\s*"([a-z_]+)"', schema_text)
+        )
+        cli_text = (project_root / "cli.py").read_text(encoding="utf-8")
+        pinnable |= set(
+            re.findall(r'_ui_config_value\(\s*\w+\s*,\s*"([a-z_]+)"', cli_text)
+        )
+
+        assert pinnable <= documented, sorted(pinnable - documented)
 
     def test_load_config_accepts_repeated_utf8_bom_without_rewriting_file(self):
         """重复 BOM 不应阻止 Windows 用户启动，也不能改写已有配置。"""
@@ -93,17 +153,53 @@ class TestConfigPersistence:
             with (
                 patch.object(config, "config_file", str(config_path)),
                 patch.object(config.logger, "error") as error_mock,
+                pytest.raises(toml.TomlDecodeError),
             ):
-                try:
-                    config.load_config()
-                except toml.TomlDecodeError:
-                    pass
-                else:
-                    raise AssertionError("expected invalid TOML to be rejected")
+                config.load_config()
 
             error_message = str(error_mock.call_args.args[0])
             assert str(config_path) in error_message
             assert "TomlDecodeError" in error_message
+
+    def test_load_config_recovers_empty_config_directory(self):
+        """Docker can create an empty directory at a missing file bind-mount path."""
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config_path = root / "config.toml"
+            config_path.mkdir()
+            (root / "config.example.toml").write_text(
+                '[app]\nvideo_source = "pexels"\n', encoding="utf-8"
+            )
+
+            with (
+                patch.object(config, "root_dir", temp_dir),
+                patch.object(config, "config_file", str(config_path)),
+            ):
+                loaded_config = config.load_config()
+
+            assert loaded_config["app"]["video_source"] == "pexels"
+            assert config_path.is_file()
+
+    def test_load_config_preserves_nonempty_config_directory(self):
+        """A mistaken config.toml directory must not be recursively deleted."""
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config_path = root / "config.toml"
+            config_path.mkdir()
+            sentinel = config_path / "user-data.txt"
+            sentinel.write_text("keep this file", encoding="utf-8")
+            (root / "config.example.toml").write_text(
+                '[app]\nvideo_source = "pexels"\n', encoding="utf-8"
+            )
+
+            with (
+                patch.object(config, "root_dir", temp_dir),
+                patch.object(config, "config_file", str(config_path)),
+            ):
+                with pytest.raises(IsADirectoryError, match="config.toml"):
+                    config.load_config()
+
+            assert sentinel.read_text(encoding="utf-8") == "keep this file"
 
     def test_kimi_uses_current_default_model(self):
         """Kimi 未配置模型覆盖值时，应使用当前发布版本的默认模型。"""
@@ -224,6 +320,50 @@ class TestConfigPersistence:
         finally:
             config.app.clear()
             config.app.update(original_app)
+            config._cfg.clear()
+            config._cfg.update(original_cfg)
+
+    def test_save_config_round_trips_windows_paths_and_nbsp(self):
+        """
+        A Windows path with a folder that starts with "x" (xiaoming, x64) and
+        a non-breaking space must load back unchanged: toml 0.10.2's encoder
+        wrote such paths as invalid TOML and the space as the text "xa0".
+        """
+        values = {
+            ("app", "ffmpeg_path"): r"C:\Users\xiaoming\ffmpeg\bin\ffmpeg.exe",
+            ("app", "material_directory"): r"D:\videos\x64",
+            ("ui", "custom_bgm_file"): r"C:\Users\xiaoming\Music\bgm.mp3",
+            ("ui", "video_script_prompt"): "Ton\N{NO-BREAK SPACE}: humoristique",
+            # TOML, unlike JSON, requires DEL to be escaped.
+            ("ui", "custom_system_prompt"): "Say \"hi\".\n\tThen stop.\x7f",
+        }
+        sections = {"app": config.app, "ui": config.ui}
+        original_cfg = dict(config._cfg)
+        original_app = dict(config.app)
+        original_ui = dict(config.ui)
+        try:
+            with TemporaryDirectory() as temp_dir:
+                config_path = Path(temp_dir) / "config.toml"
+                for (section, key), value in values.items():
+                    sections[section][key] = value
+                with (
+                    patch.object(config, "root_dir", temp_dir),
+                    patch.object(config, "config_file", str(config_path)),
+                ):
+                    config.save_config()
+
+                content = config_path.read_text(encoding="utf-8")
+                for loaded in (
+                    config._load_toml_config(str(config_path)),
+                    tomllib.loads(content),
+                ):
+                    for (section, key), value in values.items():
+                        assert loaded[section][key] == value
+        finally:
+            config.app.clear()
+            config.app.update(original_app)
+            config.ui.clear()
+            config.ui.update(original_ui)
             config._cfg.clear()
             config._cfg.update(original_cfg)
 

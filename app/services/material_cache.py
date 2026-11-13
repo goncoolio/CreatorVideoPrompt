@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
+import stat
 import tempfile
 import threading
 import time
@@ -23,6 +25,11 @@ MATERIAL_SEARCH_CACHE_TTL_SECONDS = 24 * 60 * 60
 _CACHE_FORMAT_VERSION = 2
 _CACHE_CLEANUP_INTERVAL_SECONDS = 60 * 60
 _CACHE_FILE_PATTERN = re.compile(r"^[0-9a-f]{64}\.json$")
+# 保存缓存时先写入 NamedTemporaryFile(delete=False)，再用 os.replace 发布。
+# 进程被强制终止（Ctrl+C、容器停止、断电）时 Python 的异常兜底没有机会执行，
+# 会留下一个没有被替换的中间文件；它不匹配上面的缓存文件模式，必须单独识别
+# 才能回收，否则会永久累积在缓存目录里。
+_CACHE_TEMP_FILE_PATTERN = re.compile(r"^\.[0-9a-f]{64}-[a-z0-9_]+\.tmp$")
 
 # API 默认允许多个视频任务并发执行。固定数量的锁分片可以让相同搜索条件共用
 # 一个锁，同时避免按关键词永久保存 Lock 导致内存持续增长。它只负责合并当前
@@ -167,9 +174,24 @@ def get_material_search_cache_lock(
     return _CACHE_LOCKS[int(digest[:8], 16) % len(_CACHE_LOCKS)]
 
 
-def _remove_invalid_cache(cache_path: Path) -> None:
+def _is_same_cache_file(cache_path: Path, expected: os.stat_result) -> bool:
+    """Avoid removing a file replaced since the scan/read snapshot."""
+    try:
+        current = cache_path.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return stat.S_ISREG(current.st_mode) and (
+        current.st_dev, current.st_ino, current.st_mtime_ns, current.st_size
+    ) == (expected.st_dev, expected.st_ino, expected.st_mtime_ns, expected.st_size)
+
+
+def _remove_invalid_cache(
+    cache_path: Path, expected: os.stat_result | None = None
+) -> None:
     """删除已经过期或无法解析的单个缓存文件，失败时不影响素材搜索主流程。"""
     try:
+        if expected is not None and not _is_same_cache_file(cache_path, expected):
+            return
         cache_path.unlink(missing_ok=True)
     except OSError as exc:
         logger.warning(
@@ -242,7 +264,7 @@ def load_material_search_cache(
     # 系统时间回拨或文件从其它机器复制后，mtime 可能落在未来。此时不能把
     # 缓存长期视为新鲜数据，直接失效并重新请求远端更可靠。
     if cache_age < 0 or cache_age >= MATERIAL_SEARCH_CACHE_TTL_SECONDS:
-        _remove_invalid_cache(cache_path)
+        _remove_invalid_cache(cache_path, expected=stat_result)
         return None
 
     try:
@@ -272,7 +294,8 @@ def load_material_search_cache(
                 or not item_url
                 or isinstance(item_duration, bool)
                 or not isinstance(item_duration, (int, float))
-                or item_duration <= 0
+                or (isinstance(item_duration, float) and not math.isfinite(item_duration))
+                or item_duration < 1
                 or not isinstance(source_info, dict)
                 or not source_info
             ):
@@ -291,7 +314,7 @@ def load_material_search_cache(
         logger.warning(
             f"failed to load material search cache: file={cache_path.name}, error={exc}"
         )
-        _remove_invalid_cache(cache_path)
+        _remove_invalid_cache(cache_path, expected=stat_result)
         return None
 
     logger.info(
@@ -386,11 +409,12 @@ def cleanup_expired_material_search_cache(
     force: bool = False,
 ) -> int:
     """
-    低频清理没有再次被查询到的过期搜索缓存。
+    低频清理没有再次被查询到的过期搜索缓存，以及中断写入遗留的临时文件。
 
     正常写入路径每小时最多扫描一次目录，避免每次搜索都产生线性目录遍历；
-    ``force`` 仅供测试或显式维护调用。只删除 SHA-256 命名的 JSON 文件，不会
-    触碰用户放入目录的其它文件。
+    ``force`` 仅供测试或显式维护调用。只删除 SHA-256 命名的 JSON 缓存文件和本
+    模块自己生成的 ``.tmp`` 中间文件，不会触碰用户放入目录的其它文件。两者共用
+    同一套过期判定，因此仍在写入中的临时文件不会被并发清理误删。
     """
     global _last_cleanup_monotonic
 
@@ -420,13 +444,26 @@ def cleanup_expired_material_search_cache(
     failed_count = 0
     with entries:
         for entry in entries:
-            if not _CACHE_FILE_PATTERN.fullmatch(entry.name):
+            if not (
+                _CACHE_FILE_PATTERN.fullmatch(entry.name)
+                or _CACHE_TEMP_FILE_PATTERN.fullmatch(entry.name)
+            ):
                 continue
             try:
                 if not entry.is_file(follow_symlinks=False):
                     continue
-                cache_age = current_time - entry.stat(follow_symlinks=False).st_mtime
-                if 0 <= cache_age < MATERIAL_SEARCH_CACHE_TTL_SECONDS:
+                # DirEntry.stat() reports st_dev/st_ino as 0 on Windows, which
+                # would never match the identity check in _is_same_cache_file().
+                expected = os.stat(entry.path, follow_symlinks=False)
+                cache_age = current_time - expected.st_mtime
+                if _CACHE_TEMP_FILE_PATTERN.fullmatch(entry.name):
+                    # An active write may look future-dated after a clock
+                    # rollback. Only remove temp files demonstrably old enough.
+                    if cache_age < MATERIAL_SEARCH_CACHE_TTL_SECONDS:
+                        continue
+                elif 0 <= cache_age < MATERIAL_SEARCH_CACHE_TTL_SECONDS:
+                    continue
+                if not _is_same_cache_file(Path(entry.path), expected):
                     continue
                 os.unlink(entry.path)
                 deleted_count += 1

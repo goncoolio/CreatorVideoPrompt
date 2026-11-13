@@ -28,6 +28,7 @@ def test_seedance_source_requires_confirmation_then_submits_without_secret_in_pa
     )
     with (
         patch.object(config, "app", test_config),
+        patch.object(config, "ui", dict(config.ui, voice_mode="none")),
         patch.object(config, "try_save_config", return_value=True),
         patch("app.services.webui_task.submit_generation") as submit_generation,
     ):
@@ -42,9 +43,8 @@ def test_seedance_source_requires_confirmation_then_submits_without_secret_in_pa
         _widget_by_key(app.text_area, "video_terms").set_value(
             "office worker, AI assistant"
         ).run()
-        _widget_by_key(app.selectbox, "video_source_select").select(
-            "volcengine_seedance"
-        ).run()
+        app.session_state["video_source_select_en"] = "volcengine_seedance"
+        app.run()
 
         _widget_by_key(app.button, "generate_video_button").click().run()
         assert submit_generation.call_count == 0

@@ -1,6 +1,12 @@
 import json
 import logging
+import math
+import os
 import re
+import shutil
+import subprocess
+import tempfile
+import unicodedata
 from time import perf_counter
 from typing import List
 
@@ -10,16 +16,37 @@ from openai.types.chat import ChatCompletion
 
 from app.config import config
 from app.models.llm_provider import DEFAULT_LLM_PROVIDER_ID, get_llm_provider
+from app.utils import utils
+from app.utils.request_logging import trace_sdk_call
 
 _max_retries = 5
 MIN_SCRIPT_PARAGRAPH_NUMBER = 1
 MAX_SCRIPT_PARAGRAPH_NUMBER = 10
 MAX_SCRIPT_PROMPT_LENGTH = 2000
 MAX_SCRIPT_SYSTEM_PROMPT_LENGTH = 8000
+# “测试模型链接”只发送一条极小请求。OpenAI SDK 默认 600 秒超时并自动重试
+# 2 次，端点不可达（代理、防火墙或 DNS 故障）时，测试按钮会先长时间挂起，
+# 最后只留下一句 "Request timed out."（见 issue #1642）。这里给连接测试一个
+# 有界的短超时并禁用 SDK 重试，让失败快速、可诊断；正式的脚本生成链路保持
+# SDK 默认行为不变，避免误伤慢速推理模型和本地 Ollama 冷启动。
+LLM_CONNECTION_TEST_TIMEOUT_SECONDS = 30.0
+LLM_CONNECTION_TEST_MAX_RETRIES = 0
+# 这些片段来自 OpenAI SDK 的 APITimeoutError / APIConnectionError 以及
+# httpx 的底层连接异常文案；命中任意一个即按“端点不可达”处理。
+_CONNECTION_FAILURE_MARKERS = (
+    "timed out",
+    "timeout",
+    "connection error",
+    "connection refused",
+    "connection reset",
+    "connection aborted",
+    "failed to connect",
+)
 _THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think>", re.IGNORECASE | re.DOTALL)
 _UNCLOSED_THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*$", re.IGNORECASE | re.DOTALL)
+_UNOPENED_THINK_BLOCK_RE = re.compile(r"^.*</think\s*>", re.IGNORECASE | re.DOTALL)
 _URL_USERINFO_RE = re.compile(
-    r"((?:https?|wss?)://)([^/\s?#@]*:[^/\s?#@]*@)", re.IGNORECASE
+    r"((?:https?|wss?)://)([^/\s?#@]+@)", re.IGNORECASE
 )
 _SENSITIVE_QUERY_RE = re.compile(
     r"([?&](?:api[_-]?key|access[_-]?token|token|key|secret|password)=)([^&#\s]+)",
@@ -43,6 +70,115 @@ Generate a script for a video, depending on the subject of the video.
 8. respond in the same language as the video subject.
 """.strip()
 
+# Claude Code CLI 默认使用编码 agent 的系统提示词，其中大量约束与文案写作
+# 无关，会让脚本和关键词生成偏离要求，因此调用时整体替换掉。
+CLAUDE_CODE_SYSTEM_PROMPT = (
+    "You are a concise copywriter. Follow the user's instructions and output "
+    "format exactly, and output nothing else."
+)
+CLAUDE_CODE_DEFAULT_TIMEOUT = 300.0
+# `--tools ""` 关闭全部内置工具，`--safe-mode` 关闭 CLAUDE.md、skills、hooks、
+# plugins、MCP 等所有用户级定制，同时保持鉴权、模型选择和权限正常工作。
+# 二者需要较新的 CLI；低版本会以 "unknown option" 退出，由调用处转成明确提示。
+CLAUDE_CODE_MIN_CLI_VERSION = "2.1.260"
+# 这些环境变量会让 CLI 改用 API Key 或第三方供应商（Bedrock、Vertex、Foundry、
+# Mantle、Gateway 等），从而绕过订阅登录并产生额外计费。逐个列举容易漏项，
+# 而且 CLI 后续还会新增供应商，因此按前缀整类剔除：
+#   ANTHROPIC_*           API Key、Auth Token、Base URL、各家供应商端点和 Profile
+#   CLAUDE_CODE_USE_*     供应商开关
+#   CLAUDE_CODE_SKIP_*_AUTH  跳过供应商鉴权的开关
+CLAUDE_CODE_CONFLICTING_ENV_PREFIXES = ("ANTHROPIC_", "CLAUDE_CODE_USE_")
+CLAUDE_CODE_CONFLICTING_ENV_VARS = (
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR",
+)
+# 这两类变量不能剔除：
+#   CLAUDE_CODE_OAUTH_TOKEN 是容器内唯一的订阅鉴权方式（不匹配上面的前缀）；
+#   *_CONFIG_DIR 只是指出凭证存放位置，剔除后反而会让已登录的订阅失效。
+CLAUDE_CODE_PRESERVED_ENV_VARS = (
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "ANTHROPIC_CONFIG_DIR",
+    "CLAUDE_CONFIG_DIR",
+)
+
+
+def _is_conflicting_claude_code_env(name: str) -> bool:
+    """判断某个环境变量是否会把 CLI 从订阅登录切换到别的鉴权方式。"""
+    if name in CLAUDE_CODE_PRESERVED_ENV_VARS:
+        return False
+    if name in CLAUDE_CODE_CONFLICTING_ENV_VARS:
+        return True
+    if name.startswith(CLAUDE_CODE_CONFLICTING_ENV_PREFIXES):
+        return True
+    return name.startswith("CLAUDE_CODE_SKIP_") and name.endswith("_AUTH")
+
+
+def coerce_claude_code_timeout(value, config_key: str = "claude_code_timeout"):
+    """
+    把配置里的超时值解析成正的有限秒数。
+
+    TOML 既可能写成 `claude_code_timeout = 300`（int/float），也可能写成
+    `"300"`（字符串），因此不能直接调用 `strip()`。nan / inf 会让
+    `subprocess.run(timeout=...)` 永久阻塞，这里一并拒绝。
+    """
+    if value is None:
+        return CLAUDE_CODE_DEFAULT_TIMEOUT
+
+    if isinstance(value, bool):
+        # bool 是 int 的子类，但 True 秒显然不是用户想要的超时配置。
+        raise ValueError(f"{config_key} must be a number of seconds, got {value!r}")
+
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return CLAUDE_CODE_DEFAULT_TIMEOUT
+        try:
+            seconds = float(text)
+        except ValueError:
+            raise ValueError(
+                f"{config_key} must be a number of seconds, got {value!r}"
+            ) from None
+    elif isinstance(value, (int, float)):
+        seconds = float(value)
+    else:
+        raise ValueError(f"{config_key} must be a number of seconds, got {value!r}")
+
+    if not math.isfinite(seconds):
+        raise ValueError(f"{config_key} must be a finite number, got {value!r}")
+    if seconds <= 0:
+        raise ValueError(f"{config_key} must be greater than 0, got {value!r}")
+    return seconds
+
+
+def _resolve_provider_field_value(raw_value, default_value):
+    """
+    只有「未配置」时才回退到 Registry 默认值。
+
+    之前用 `raw or default_value`，会把 0 和 false 这类合法取值也当成未配置
+    替换掉：`claude_code_timeout = 0` 被静默改成 300，而 `"0"` 却报错。默认值
+    只在 None 或空白字符串时生效，配置校验才能对所有写法保持一致。
+    """
+    if raw_value is None:
+        return default_value
+    if isinstance(raw_value, str) and not raw_value.strip():
+        return default_value
+    return raw_value
+
+
+def build_claude_code_env(base_env=None):
+    """
+    构造只依赖订阅登录的子进程环境。
+
+    返回 (环境变量字典, 被剔除的变量名列表)。剔除的是会切换鉴权方式或供应商
+    的变量，`CLAUDE_CODE_OAUTH_TOKEN` 必须保留：容器内没有 keychain，CLI 只能
+    靠它完成订阅鉴权。
+    """
+    env = dict(os.environ if base_env is None else base_env)
+    removed = sorted(name for name in env if _is_conflicting_claude_code_env(name))
+    for name in removed:
+        env.pop(name, None)
+    return env, removed
+
 
 def _normalize_text_response(content, llm_provider: str) -> str:
     # 不同 LLM SDK 在异常或被拦截场景下，可能返回 None、空字符串，
@@ -60,6 +196,10 @@ def _normalize_text_response(content, llm_provider: str) -> str:
     # `<think>...</think>` 中返回。视频脚本和关键词只需要最终可朗读文本，
     # 如果不在服务层统一清理，WebUI、字幕和配音都会把思考过程当正文处理。
     content = _THINK_BLOCK_RE.sub("", content)
+    # DeepSeek R1、QwQ 等模型的对话模板会把起始 `<think>` 放进提示词，
+    # vLLM/Ollama 等网关返回的正文只剩 `推理...</think>答案`。成对清理之后
+    # 仍残留的闭合标签之前都是推理内容，也不能进入脚本。
+    content = _UNOPENED_THINK_BLOCK_RE.sub("", content)
     content = _UNCLOSED_THINK_BLOCK_RE.sub("", content).strip()
     if not content:
         raise ValueError(f"[{llm_provider}] returned empty text content")
@@ -113,6 +253,39 @@ def _get_response_field(value, key: str):
         return getattr(value, key, None)
 
 
+def _sdk_transport_options(request_timeout, max_retries) -> dict:
+    """把可选的超时/重试约束转换为 OpenAI SDK 客户端构造参数。
+
+    两个参数传 None 时返回空字典，客户端继续使用 SDK 默认值（600 秒超时、
+    2 次自动重试），因此脚本生成等常规链路行为保持不变；只有连接测试这类
+    需要快速失败的调用方显式传入有界值时，请求预算才会被收紧。
+    """
+    options = {}
+    if request_timeout is not None:
+        options["timeout"] = request_timeout
+    if max_retries is not None:
+        options["max_retries"] = max_retries
+    return options
+
+
+def _explain_connection_test_failure(error_message: str) -> str:
+    """为超时/连接类失败补充排查方向，而不是只显示一句 SDK 原始文案。
+
+    issue #1642 中用户的 API 本身可用，失败原因是本机到端点的链路问题
+    （代理、防火墙或 DNS），但 "Request timed out." 没有指向任何可能原因。
+    其它错误（鉴权、配额等）保持原文返回。
+    """
+    normalized = (error_message or "").lower()
+    if not any(marker in normalized for marker in _CONNECTION_FAILURE_MARKERS):
+        return error_message
+    return (
+        f"{error_message} (the request did not complete within "
+        f"{LLM_CONNECTION_TEST_TIMEOUT_SECONDS:.0f}s). Please check that the "
+        "configured base URL is reachable from this machine, and that no proxy "
+        "or firewall is blocking the request."
+    )
+
+
 def _extract_qwen_generation_text(response) -> str:
     """
     从 DashScope Generation 响应中提取文本。
@@ -139,7 +312,14 @@ def _extract_qwen_generation_text(response) -> str:
     return _normalize_text_response(text, "qwen")
 
 
-def _generate_response(prompt: str, app_config=None) -> str:
+def _generate_response(
+    prompt: str,
+    app_config=None,
+    request_timeout: float | None = None,
+    max_retries: int | None = None,
+) -> str:
+    sdk_client = None
+    sdk_stream = None
     try:
         # WebUI 在视频生成期间允许用户准备下一条文案。调用方可以传入提交瞬间
         # 的配置快照，确保模型请求重试期间不会因为后台任务结束并应用新配置，
@@ -188,9 +368,9 @@ def _generate_response(prompt: str, app_config=None) -> str:
             )
 
         extra_values = {
-            field.config_suffix: (
-                runtime_app_config.get(provider.config_key(field.config_suffix), "")
-                or field.default_value
+            field.config_suffix: _resolve_provider_field_value(
+                runtime_app_config.get(provider.config_key(field.config_suffix)),
+                field.default_value,
             )
             for field in provider.extra_fields
         }
@@ -219,9 +399,11 @@ def _generate_response(prompt: str, app_config=None) -> str:
             import dashscope
             from dashscope.api_entities.dashscope_response import GenerationResponse
 
-            dashscope.api_key = api_key
-            response = dashscope.Generation.call(
-                model=model_name, messages=[{"role": "user", "content": prompt}]
+            response = trace_sdk_call(
+                llm_provider, base_url, dashscope.Generation.call,
+                model=model_name,
+                messages=[{"role": "user", "content": prompt}],
+                api_key=api_key,
             )
             if response:
                 if isinstance(response, GenerationResponse):
@@ -276,7 +458,8 @@ def _generate_response(prompt: str, app_config=None) -> str:
                     api_key=api_key,
                     http_options=http_options,
                 ) as client:
-                    response = client.models.generate_content(
+                    response = trace_sdk_call(
+                        llm_provider, base_url, client.models.generate_content,
                         model=model_name,
                         contents=prompt,
                         config=generation_config,
@@ -294,14 +477,16 @@ def _generate_response(prompt: str, app_config=None) -> str:
             # Cloudflare 当前推荐的 AI Gateway REST API 兼容 OpenAI SDK。
             # Account ID 用于构造统一端点，Gateway ID 通过请求头选择；这里
             # 不再调用 Workers AI 的 /ai/run/{model} 专用接口。
-            client = OpenAI(
+            client = sdk_client = OpenAI(
                 api_key=api_key,
                 base_url=(
                     f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1"
                 ),
                 default_headers={"cf-aig-gateway-id": gateway_id},
+                **_sdk_transport_options(request_timeout, max_retries),
             )
-            response = client.chat.completions.create(
+            response = trace_sdk_call(
+                llm_provider, base_url, client.chat.completions.create,
                 model=model_name,
                 messages=[{"role": "user", "content": prompt}],
             )
@@ -315,7 +500,8 @@ def _generate_response(prompt: str, app_config=None) -> str:
                     f"{llm_provider}: model_name is not set, please set it in the config.toml file."
                 )
 
-            response = litellm.completion(
+            response = trace_sdk_call(
+                llm_provider, base_url, litellm.completion,
                 model=model_name,
                 messages=[{"role": "user", "content": prompt}],
                 drop_params=True,
@@ -334,12 +520,14 @@ def _generate_response(prompt: str, app_config=None) -> str:
             # 这里在 Azure 分支内完成请求并立即返回，避免客户端被后续 fallback
             # 覆盖，导致用户配置的 Azure 凭证通过校验但实际请求没有被使用。
             logger.info(f"requesting azure chat completion, model: {model_name}")
-            client = AzureOpenAI(
+            client = sdk_client = AzureOpenAI(
                 api_key=api_key,
                 api_version=api_version,
                 azure_endpoint=base_url,
+                **_sdk_transport_options(request_timeout, max_retries),
             )
-            response = client.chat.completions.create(
+            response = trace_sdk_call(
+                llm_provider, base_url, client.chat.completions.create,
                 model=model_name, messages=[{"role": "user", "content": prompt}]
             )
             if response:
@@ -355,13 +543,211 @@ def _generate_response(prompt: str, app_config=None) -> str:
                     f"[{llm_provider}] returned an empty response, please check your network connection and try again."
                 )
 
+        if adapter in {"openai_codex", "openai_chatgpt"}:
+            if adapter == "openai_chatgpt":
+                from app.services import chatgpt_oauth as subscription_provider
+            else:
+                from app.services import codex_oauth as subscription_provider
+
+            timeout_seconds = coerce_claude_code_timeout(
+                extra_values.get("timeout"), provider.config_key("timeout")
+            )
+            if request_timeout is not None:
+                timeout_seconds = min(timeout_seconds, request_timeout)
+            return _normalize_text_response(
+                subscription_provider.generate_text(prompt, model_name, timeout_seconds),
+                llm_provider,
+            )
+
+        if adapter == "claude_code":
+            # Claude 订阅（Pro / Max / Team）不签发 API Key，其凭证只能由
+            # Claude Code 官方客户端自己使用。这里不直接请求 Anthropic API，
+            # 而是以 headless 模式调用本机已登录的 claude CLI（`claude -p`），
+            # 由 CLI 完成鉴权，脚本生成只消费它返回的文本。
+            configured_cli = (extra_values.get("cli_path") or "").strip() or "claude"
+            cli_path = shutil.which(configured_cli)
+            if not cli_path and os.path.isfile(configured_cli):
+                cli_path = configured_cli
+            if not cli_path:
+                raise ValueError(
+                    f"{llm_provider}: claude CLI not found ('{configured_cli}'), "
+                    f"install it in the runtime or set "
+                    f"{provider.config_key('cli_path')} in the config.toml file."
+                )
+
+            try:
+                timeout_seconds = coerce_claude_code_timeout(
+                    extra_values.get("timeout"), provider.config_key("timeout")
+                )
+            except ValueError as timeout_error:
+                raise ValueError(f"{llm_provider}: {timeout_error}") from None
+
+            # prompt 通过 stdin 传入，不放在命令行里：Windows 上 npm 安装的
+            # claude 是 claude.cmd，cmd.exe 会在第一个换行处截断参数，多行
+            # prompt 和其后的隔离参数都会丢失。
+            command = [
+                cli_path,
+                "-p",
+                "--output-format",
+                "json",
+                "--system-prompt",
+                CLAUDE_CODE_SYSTEM_PROMPT,
+                # 关闭全部内置工具，保证只做文本生成。
+                "--tools",
+                "",
+                # 关闭 CLAUDE.md、skills、hooks、plugins、MCP 等用户级定制；
+                # 鉴权与模型选择不受影响（不能用 --bare，它会禁用 OAuth）。
+                "--safe-mode",
+            ]
+            # 模型名留空时沿用 CLI 自己的默认模型，避免这里硬编码的模型 ID
+            # 随订阅可用模型变化而失效。
+            if model_name:
+                command += ["--model", model_name]
+
+            cli_env, removed_env = build_claude_code_env()
+            if removed_env:
+                # 只记录变量名，不记录取值，避免把密钥写进日志。
+                logger.warning(
+                    f"{llm_provider}: ignoring conflicting environment variables "
+                    f"so the subscription login is used: {', '.join(removed_env)}"
+                )
+
+            logger.info(f"invoking claude cli, model: {model_name or 'cli default'}")
+            # CLI 会读取工作目录下的 CLAUDE.md 和项目设置，这些内容会污染
+            # 文案结果，因此固定在一个临时空目录中执行。
+            with tempfile.TemporaryDirectory() as work_dir:
+                try:
+                    completed = subprocess.run(
+                        command,
+                        input=prompt,
+                        capture_output=True,
+                        text=True,
+                        # The CLI always emits UTF-8. Without an explicit encoding,
+                        # text=True decodes with the system locale (e.g. cp1252 on
+                        # non-English Windows), so every non-ASCII character reaches
+                        # the script as mojibake.
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=timeout_seconds,
+                        cwd=work_dir,
+                        env=cli_env,
+                    )
+                except subprocess.TimeoutExpired:
+                    raise Exception(
+                        f"[{llm_provider}] claude cli timed out after "
+                        f"{timeout_seconds:.0f}s"
+                    )
+
+            # 未登录、用量耗尽这类失败同样会返回 JSON（`is_error` 为真，
+            # `result` 是可读原因），只是退出码非 0。因此先解析 stdout，
+            # 只有在拿不到 JSON 时才回退到退出码和 stderr。
+            stdout = (completed.stdout or "").strip()
+            try:
+                payload = json.loads(stdout) if stdout else None
+            except json.JSONDecodeError:
+                payload = None
+
+            if payload is None:
+                detail = (completed.stderr or stdout or "").strip()
+                if "unknown option" in detail.lower():
+                    raise Exception(
+                        f"[{llm_provider}] the installed claude CLI does not support "
+                        f"the required isolation flags; upgrade to "
+                        f"{CLAUDE_CODE_MIN_CLI_VERSION} or newer: {detail[:300]}"
+                    )
+                if completed.returncode != 0:
+                    raise Exception(
+                        f"[{llm_provider}] claude cli exited with code "
+                        f"{completed.returncode}: {detail[:500]}"
+                    )
+                raise Exception(
+                    f'[{llm_provider}] returned an invalid response: "{detail[:500]}"'
+                )
+
+            if payload.get("is_error") or completed.returncode != 0:
+                reason = str(payload.get("result") or "").strip() or (
+                    f"claude cli exited with code {completed.returncode}"
+                )
+                # 容器里无法执行交互式 /login，这里直接给出可用的鉴权方式。
+                if "login" in reason.lower():
+                    reason += (
+                        " (run `claude setup-token` on the host and pass the token "
+                        "to the container as CLAUDE_CODE_OAUTH_TOKEN)"
+                    )
+                raise Exception(
+                    f'[{llm_provider}] returned an error response: "{reason[:500]}"'
+                )
+
+            return _normalize_text_response(payload.get("result"), llm_provider)
+
+        if adapter == "kimi_code":
+            # Kimi 订阅（Plus+ 的 Kimi Code 权益）不签发按量 API Key，鉴权由
+            # OAuth 设备授权完成：WebUI 引导用户在浏览器里一键确认，本地保存
+            # refresh token；access token 15 分钟过期，由 kimi_code_oauth 透明
+            # 续期。请求走官方 OpenAI 兼容端点，与按量 API 是两套独立额度。
+            from app.services import kimi_code_oauth
+
+            try:
+                timeout_seconds = kimi_code_oauth.coerce_timeout(
+                    extra_values.get("timeout")
+                )
+            except ValueError as timeout_error:
+                raise ValueError(f"{llm_provider}: {timeout_error}") from None
+
+            access_token = kimi_code_oauth.get_valid_access_token()
+            # 授权区域以凭证为准：token 只对签发它的区域有效。用户在授权后切换
+            # API Platform 时，若按界面区域发请求会把中国签发的 token 打到
+            # Global 端点（必然 401），因此请求地址优先跟随 token 的签发区域。
+            authorized_region = kimi_code_oauth.authorized_region()
+            if authorized_region:
+                request_base_url = kimi_code_oauth.api_base_url(authorized_region)
+                if base_url and authorized_region != kimi_code_oauth.resolve_region(
+                    base_url
+                ):
+                    logger.warning(
+                        f"kimi_code: API Platform selection differs from the "
+                        f"authorized region; using '{authorized_region}' to match "
+                        "the issued token"
+                    )
+            else:
+                request_base_url = base_url or kimi_code_oauth.api_base_url(
+                    kimi_code_oauth.resolve_region(base_url)
+                )
+            # 模型名留空时默认 kimi-for-coding：订阅权益内的专用编码模型，
+            # 避免硬编码的通用模型 id 随权益变化而失效。
+            request_model = model_name or "kimi-for-coding"
+            logger.info(f"requesting kimi code chat completion, model: {request_model}")
+            # Provider 自身的宽松超时在连接测试场景下要收紧到测试预算以内。
+            effective_timeout = timeout_seconds
+            if request_timeout is not None:
+                effective_timeout = min(effective_timeout, request_timeout)
+            client = sdk_client = OpenAI(
+                api_key=access_token,
+                base_url=request_base_url,
+                timeout=effective_timeout,
+                # 服务端反爬管线要求与 CLI 一致的设备身份头。
+                default_headers=kimi_code_oauth.api_headers(),
+                **_sdk_transport_options(None, max_retries),
+            )
+            response = trace_sdk_call(
+                llm_provider, base_url, client.chat.completions.create,
+                model=request_model, messages=[{"role": "user", "content": prompt}]
+            )
+            if response and isinstance(response, ChatCompletion):
+                return _extract_chat_completion_text(response, llm_provider)
+            raise Exception(
+                f'[{llm_provider}] returned an invalid response: "{response}"'
+            )
+
         if adapter == "modelscope":
             content = ""
-            client = OpenAI(
+            client = sdk_client = OpenAI(
                 api_key=api_key,
                 base_url=base_url,
+                **_sdk_transport_options(request_timeout, max_retries),
             )
-            response = client.chat.completions.create(
+            response = sdk_stream = trace_sdk_call(
+                llm_provider, base_url, client.chat.completions.create,
                 model=model_name,
                 messages=[{"role": "user", "content": prompt}],
                 extra_body={"enable_thinking": False},
@@ -382,12 +768,14 @@ def _generate_response(prompt: str, app_config=None) -> str:
             else:
                 raise Exception(f"[{llm_provider}] returned an empty response")
 
-        client = OpenAI(
+        client = sdk_client = OpenAI(
             api_key=api_key,
             base_url=base_url,
+            **_sdk_transport_options(request_timeout, max_retries),
         )
 
-        response = client.chat.completions.create(
+        response = trace_sdk_call(
+            llm_provider, base_url, client.chat.completions.create,
             model=model_name, messages=[{"role": "user", "content": prompt}]
         )
         if response:
@@ -406,6 +794,17 @@ def _generate_response(prompt: str, app_config=None) -> str:
     except Exception as e:
         return f"Error: {_sanitize_error_message(e)}"
 
+    finally:
+        for resource in (sdk_stream, sdk_client):
+            close = getattr(resource, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception as cleanup_error:
+                    logger.warning(
+                        f"could not close LLM transport: {type(cleanup_error).__name__}"
+                    )
+
 
 def test_connection() -> tuple[bool, str, float]:
     """
@@ -413,10 +812,17 @@ def test_connection() -> tuple[bool, str, float]:
 
     连接测试直接复用 `_generate_response()`，因此会覆盖 API Key、Base URL、
     模型名称和 Provider 专用字段，但不会进入脚本生成的重试逻辑，也不会发送
-    用户的视频主题或文案。返回值依次为成功状态、错误信息和请求耗时。
+    用户的视频主题或文案。请求使用有界的短超时并禁用 SDK 自动重试：端点
+    不可达（代理、防火墙或 DNS 故障）时快速失败，并附上排查方向，而不是
+    挂起数分钟后只留下 "Request timed out."（issue #1642）。返回值依次为
+    成功状态、错误信息和请求耗时。
     """
     started_at = perf_counter()
-    response = _generate_response(prompt="Reply with exactly: OK")
+    response = _generate_response(
+        prompt="Reply with exactly: OK",
+        request_timeout=LLM_CONNECTION_TEST_TIMEOUT_SECONDS,
+        max_retries=LLM_CONNECTION_TEST_MAX_RETRIES,
+    )
     elapsed = perf_counter() - started_at
 
     if not response:
@@ -425,7 +831,9 @@ def test_connection() -> tuple[bool, str, float]:
         return False, error_message, elapsed
 
     if response.startswith("Error:"):
-        error_message = response.removeprefix("Error:").strip()
+        error_message = _explain_connection_test_failure(
+            response.removeprefix("Error:").strip()
+        )
         logger.warning(f"llm connection test failed: {error_message}")
         return False, error_message, elapsed
 
@@ -532,9 +940,22 @@ def generate_script(
 
     def format_response(response):
         # Clean the script
-        # Remove asterisks, hashes
+        # Remove emphasis and heading markers without changing inline names
+        # or musical notes such as C#, F# and G#.
         response = response.replace("*", "")
-        response = response.replace("#", "")
+        response = re.sub(
+            r"(?m)^[ \t]{0,3}#{1,6}[ \t]+(.*?)[ \t]*$",
+            lambda match: re.sub(r"[ \t]+#+[ \t]*$", "", match.group(1)),
+            response,
+        )
+
+        # Link labels are narration; discard destinations before stripping
+        # bracketed stage directions. Common parenthesized URL components fit.
+        response = re.sub(
+            r"\[([^\]\n]+)\]\((?:[^()\n]|\([^()\n]*\))*\)",
+            lambda match: match.group(1),
+            response,
+        )
 
         # Remove markdown syntax.  Use non-greedy .*? so each bracket/paren
         # group is removed independently; the greedy form would eat all text
@@ -557,24 +978,30 @@ def generate_script(
                 response = _generate_response(prompt=prompt)
             else:
                 response = _generate_response(prompt=prompt, app_config=app_config)
+            if isinstance(response, str) and response.startswith("Error: "):
+                # _generate_response returns provider failures as text. Passing
+                # that text through would make the task treat it as narration.
+                raise ValueError(response)
             if response:
-                final_script = format_response(response)
+                candidate = format_response(_strip_code_fence(response)).strip()
             else:
                 logging.error("gpt returned an empty response")
+                candidate = ""
 
             # Some upstream providers may return quota errors as plain text.
-            if final_script and "当日额度已消耗完" in final_script:
-                raise ValueError(final_script)
+            if candidate and "当日额度已消耗完" in candidate:
+                raise ValueError(candidate)
 
-            if final_script:
+            if candidate:
+                final_script = candidate
                 break
         except Exception as e:
             logger.error(f"failed to generate script: {e}")
 
         if i < _max_retries - 1:
             logger.warning(f"failed to generate video script, trying again... {i + 1}")
-    if "Error: " in final_script:
-        logger.error(f"failed to generate video script: {final_script}")
+    if not final_script:
+        logger.error("failed to generate video script after retries")
     else:
         logger.success(f"completed: \n{final_script}")
     return final_script.strip()
@@ -596,6 +1023,20 @@ def _strip_code_fence(text: str) -> str:
     return t.strip()
 
 
+def _extract_embedded_json(text: str, opening: str):
+    """Decode one complete JSON value without absorbing later prose/examples."""
+    decoder = json.JSONDecoder()
+    for index, character in enumerate(text or ""):
+        if character != opening:
+            continue
+        try:
+            value, _end = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError:
+            continue
+        return value
+    raise ValueError("response contains no complete JSON value")
+
+
 def generate_terms(
     video_subject: str,
     video_script: str,
@@ -603,6 +1044,7 @@ def generate_terms(
     match_script_order: bool = False,
     app_config=None,
 ) -> List[str]:
+    video_script = utils.remove_pause_tags(video_script or "").strip()
     if match_script_order:
         goal = (
             f"Generate {amount} chronological stock-video search terms that follow "
@@ -663,6 +1105,7 @@ Please note that you must use English for generating video search terms; Chinese
     search_terms = []
     response = ""
     for i in range(_max_retries):
+        search_terms = []
         try:
             if app_config is None:
                 response = _generate_response(prompt)
@@ -676,26 +1119,27 @@ Please note that you must use English for generating video search terms; Chinese
                 logger.error(f"failed to generate video terms: {response}")
                 return []
             search_terms = json.loads(_strip_code_fence(response))
-            if not isinstance(search_terms, list) or not all(
-                isinstance(term, str) for term in search_terms
-            ):
-                logger.error("response is not a list of strings.")
-                continue
-
         except Exception as e:
             logger.warning(f"failed to generate video terms: {str(e)}")
             if response:
-                match = re.search(r"\[.*]", response, re.DOTALL)
-                if match:
-                    try:
-                        search_terms = json.loads(match.group())
-                    except Exception as e:
-                        # 这里保留重试流程，但必须记录 LLM 返回的非标准 JSON，
-                        # 否则后续排查搜索词为空时无法定位
-                        # 是模型格式问题还是解析逻辑问题。
-                        logger.warning(f"failed to generate video terms: {str(e)}")
+                try:
+                    search_terms = _extract_embedded_json(response, "[")
+                except ValueError as e:
+                    logger.warning(f"failed to generate video terms: {str(e)}")
 
-        if search_terms and len(search_terms) > 0:
+        # Apply the same contract to direct JSON and prose-wrapped recovery.
+        # Otherwise a nonempty array of numbers or objects reaches material search.
+        if not isinstance(search_terms, list) or not all(
+            isinstance(term, str) for term in search_terms
+        ):
+            logger.error("response is not a list of strings.")
+            search_terms = []
+
+        # The model may ignore the requested count or return blank strings.
+        # Enforce the prompt contract before material providers are contacted;
+        # repeated topics remain meaningful in chronological mode.
+        search_terms = [term.strip() for term in search_terms if term.strip()][:amount]
+        if search_terms:
             break
         if i < _max_retries - 1:
             logger.warning(f"failed to generate video terms, trying again... {i + 1}")
@@ -802,7 +1246,8 @@ def _normalize_hashtags(raw, count: int) -> List[str]:
     重复标签或不符合常见格式的 hashtag。
     """
     if isinstance(raw, str):
-        candidates = re.split(r"[\s,]+", raw)
+        # CJK text separates tags with ，、； and no spaces; # starts a new tag.
+        candidates = re.split(r"[\s,，、;；#]+", raw)
     elif isinstance(raw, (list, tuple)):
         # 数组里的每一项视为一个完整标签，因此 "du lich" 会变成
         # "#dulich"，而不是拆成两个标签。
@@ -813,7 +1258,24 @@ def _normalize_hashtags(raw, count: int) -> List[str]:
     seen = set()
     result: List[str] = []
     for item in candidates:
-        tag = re.sub(r"[^\w]", "", item, flags=re.UNICODE)
+        # 印地语、泰语等依赖组合符，不能像 \w 那样直接删除。但组合符必须
+        # 附着于保留的字符；emoji 被删除后，其变体选择符也应丢弃，否则
+        # #☕️ 会留下只有不可见字符的标签，#coffee☕️ 也无法与 #coffee 去重。
+        # 数字本身会保留，因此还需清理 emoji 展示选择符和键帽组合符，
+        # 让 #1️⃣ 与 #1 一致；其它语言组合符和 CJK 字形变体仍按附着规则保留。
+        characters = []
+        can_attach_mark = False
+        for character in item:
+            if character in {"\ufe0e", "\ufe0f", "\u20e3"}:
+                can_attach_mark = False
+            elif character.isalnum() or character == "_":
+                characters.append(character)
+                can_attach_mark = True
+            elif can_attach_mark and unicodedata.category(character).startswith("M"):
+                characters.append(character)
+            else:
+                can_attach_mark = False
+        tag = "".join(characters)
         if not tag:
             continue
         key = tag.lower()
@@ -879,9 +1341,7 @@ def _parse_social_metadata(response: str, platform: str) -> dict:
     except Exception:
         # 部分模型会在 JSON 外层包一段说明文字或 markdown fence。
         # API 调用方只需要稳定结构，所以这里尝试提取第一个 JSON object。
-        match = re.search(r"\{.*\}", response or "", re.DOTALL)
-        if match:
-            data = json.loads(match.group())
+        data = _extract_embedded_json(response, "{")
 
     if not isinstance(data, dict):
         raise ValueError("social metadata response is not a JSON object")
@@ -896,6 +1356,41 @@ def _parse_social_metadata(response: str, platform: str) -> dict:
     return {"title": title, "caption": caption, "hashtags": hashtags}
 
 
+# A period with a following space is not the end of the first sentence when
+# it marks a numbered tip at the start of a line ("1. Save weekly."), closes a
+# dotted abbreviation ("U.S. policy", "10:30 a.m."), or follows a short title
+# ("No. 1", "Mr. Smith", "Fig. 3"). "My score is 42." and "option A." still end
+# the sentence. "2.0" has no space after the dot and never reaches this check.
+_SOCIAL_TITLE_ABBREVIATIONS = frozenset(
+    {"no", "fig", "vol", "mr", "mrs", "ms", "dr", "st", "prof", "jr", "sr"}
+)
+_SOCIAL_TITLE_BREAK = re.compile(r"(?<=[.!?])\s+|(?<=[。！？])\s*")
+_SOCIAL_TITLE_TOKEN = re.compile(r"[A-Za-z]+$|[0-9]+$")
+
+
+def _first_social_title_sentence(script: str) -> str:
+    """Return the first sentence of a fallback title."""
+    for match in _SOCIAL_TITLE_BREAK.finditer(script):
+        punctuation = script[match.start() - 1]
+        if punctuation != ".":
+            return script[: match.start()]
+        head = script[: match.start() - 1]
+        token = _SOCIAL_TITLE_TOKEN.search(head)
+        if token is None:
+            return script[: match.start()]
+        word = token.group()
+        before = head[: token.start()].rstrip(" \t")
+        if word.isdigit():
+            is_marker = not before or before.endswith("\n")
+        elif len(word) == 1:
+            is_marker = before.endswith(".")
+        else:
+            is_marker = word.lower() in _SOCIAL_TITLE_ABBREVIATIONS
+        if not is_marker:
+            return script[: match.start()]
+    return script
+
+
 def _fallback_social_metadata(
     video_subject: str, video_script: str, platform: str
 ) -> dict:
@@ -905,8 +1400,8 @@ def _fallback_social_metadata(
 
     title = subject
     if not title and script:
-        # 没有主题时，用脚本第一句兜底生成 title，避免接口返回空标题。
-        title = re.split(r"(?<=[.!?。！？])\s+", script)[0]
+        # 中日文句末通常没有空格；英文仍要求空白，避免拆开 2.0 等数字。
+        title = _first_social_title_sentence(script)
 
     return {
         "title": _clamp_text(title, spec["title_max"]),
@@ -948,7 +1443,7 @@ def generate_social_metadata(
     for i in range(_max_retries):
         try:
             response = _generate_response(prompt)
-            if isinstance(response, str) and "Error: " in response:
+            if isinstance(response, str) and response.startswith("Error: "):
                 logger.error(f"failed to generate social metadata: {response}")
                 break
             metadata = _parse_social_metadata(response, platform)

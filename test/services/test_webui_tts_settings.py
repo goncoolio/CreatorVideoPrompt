@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 from streamlit.testing.v1 import AppTest
 
 from app.config import config
@@ -24,6 +25,7 @@ TTS_API_KEY_LABELS = {
     "MiniMax TTS API Key": "platform.minimaxi.com",
     "ElevenLabs API Key": "elevenlabs.io/app/settings/api-keys",
     "Chatterbox API Key": "github.com/travisvn/chatterbox-tts-api",
+    "VoxCPM API Key": "platform.modelbest.cn/console/keys",
 }
 
 TTS_PROVIDER_WIDGETS = {
@@ -34,6 +36,7 @@ TTS_PROVIDER_WIDGETS = {
     "minimax-tts": ("minimax_tts_api_key_input", "MiniMax TTS API Key"),
     "elevenlabs": ("elevenlabs_api_key_input", "ElevenLabs API Key"),
     "chatterbox": ("chatterbox_api_key_input", "Chatterbox API Key"),
+    "voxcpm": ("voxcpm_api_key_input", "VoxCPM API Key"),
 }
 
 
@@ -96,6 +99,151 @@ def test_tts_provider_inputs_render_the_standardized_labels():
             assert api_key_input.proto.type == api_key_input.proto.PASSWORD
             assert not getattr(api_key_input.proto, "help", "")
 
+    assert [str(item.value) for item in app.exception] == []
+
+
+def test_voxcpm_settings_render_model_and_endpoint_fields():
+    test_config = dict(
+        config.voxcpm,
+        api_key="",
+        model_id="speech-model",
+        base_url=voice.VOXCPM_DEFAULT_BASE_URL,
+        voice_id=voice.VOXCPM_DEFAULT_VOICE,
+    )
+    test_ui = dict(
+        config.ui,
+        voice_mode="tts",
+        tts_server="voxcpm",
+        voice_name="voxcpm:default",
+    )
+
+    with (
+        patch.object(config, "voxcpm", test_config),
+        patch.object(config, "ui", test_ui),
+        patch.object(config, "try_save_config", return_value=True),
+    ):
+        app = AppTest.from_file(str(WEBUI_MAIN), default_timeout=30)
+        app.session_state["ui_language"] = "en"
+        app.run()
+
+    api_key_input = _widget_by_key(app.text_input, "voxcpm_api_key_input")
+    assert api_key_input.proto.type == api_key_input.proto.PASSWORD
+    assert _widget_by_key(app.text_input, "voxcpm_model_id_input").value == "speech-model"
+    assert (
+        _widget_by_key(app.text_input, "voxcpm_base_url_input").value
+        == voice.VOXCPM_DEFAULT_BASE_URL
+    )
+    speed_input = _widget_by_key(app.selectbox, "voice_rate_select")
+    assert speed_input.disabled
+    assert "does not support numeric speed" in speed_input.help
+    assert [str(item.value) for item in app.exception] == []
+
+
+@pytest.mark.parametrize(
+    ("tts_server", "voice_name", "disabled", "speed_help"),
+    [
+        (
+            "gemini-tts",
+            "gemini:Zephyr-Bright",
+            True,
+            "Gemini TTS does not support numeric speed adjustment.",
+        ),
+        (
+            "mimo-tts",
+            "mimo:mimo_default-Female",
+            True,
+            "MiMo TTS does not support numeric speed adjustment.",
+        ),
+        (
+            "azure-tts-v1",
+            "en-US-AriaNeural-Female",
+            False,
+            "Applies only to automatic voiceover. 1.0× is the normal speed.",
+        ),
+    ],
+)
+def test_speed_selector_is_disabled_for_providers_without_a_speed_setting(
+    tts_server, voice_name, disabled, speed_help
+):
+    """Gemini and MiMo, like VoxCPM, have no speed setting; the saved speed is kept."""
+    test_ui = dict(
+        config.ui,
+        voice_mode="tts",
+        tts_server=tts_server,
+        voice_name=voice_name,
+        voice_rate=1.5,
+    )
+
+    with (
+        patch.object(config, "ui", test_ui),
+        patch.object(config, "try_save_config", return_value=True),
+    ):
+        app = AppTest.from_file(str(WEBUI_MAIN), default_timeout=30)
+        app.session_state["ui_language"] = "en"
+        app.run()
+
+    speed_input = _widget_by_key(app.selectbox, "voice_rate_select")
+    assert speed_input.disabled == disabled
+    assert speed_input.help == speed_help
+    assert speed_input.value == 1.5
+    assert test_ui["voice_rate"] == 1.5
+    assert [str(item.value) for item in app.exception] == []
+
+
+def test_voxcpm_settings_render_reference_audio_with_cloud_notice():
+    test_config = dict(
+        config.voxcpm,
+        api_key="",
+        model_id="speech-model",
+        base_url=voice.VOXCPM_DEFAULT_BASE_URL,
+        voice_id=voice.VOXCPM_DEFAULT_VOICE,
+    )
+    test_ui = dict(
+        config.ui,
+        voice_mode="tts",
+        tts_server="voxcpm",
+        voice_name="voxcpm:default",
+    )
+
+    with (
+        patch.object(config, "voxcpm", test_config),
+        patch.object(config, "ui", test_ui),
+        patch.object(config, "try_save_config", return_value=True),
+    ):
+        app = AppTest.from_file(str(WEBUI_MAIN), default_timeout=30)
+        app.session_state["ui_language"] = "en"
+        app.run()
+
+    uploader = _widget_by_key(app.file_uploader, "voxcpm_reference_audio_uploader")
+    assert uploader.label == "VoxCPM Reference Audio (Optional)"
+    assert "short reference clip" in uploader.help
+    assert any("sent to ModelBest" in str(item.value) for item in app.caption)
+    assert "voxcpm_reference_audio" not in test_config
+    assert [str(item.value) for item in app.exception] == []
+
+
+def test_voxcpm_reconnect_restores_saved_key_instead_of_clearing_it():
+    """Streamlit 重连重放空密码状态时，VoxCPM Key 仍应保留。"""
+    test_config = dict(config.voxcpm, api_key="saved-voxcpm-key")
+    test_ui = dict(
+        config.ui,
+        voice_mode="tts",
+        tts_server="voxcpm",
+        voice_name="voxcpm:default",
+    )
+
+    with (
+        patch.object(config, "voxcpm", test_config),
+        patch.object(config, "ui", test_ui),
+        patch.object(config, "try_save_config", return_value=True),
+    ):
+        app = AppTest.from_file(str(WEBUI_MAIN), default_timeout=30)
+        app.session_state["ui_language"] = "en"
+        app.session_state["voxcpm_api_key_input"] = ""
+        app.run()
+
+    assert test_config["api_key"] == "saved-voxcpm-key"
+    assert app.session_state["voxcpm_api_key_input"] == "saved-voxcpm-key"
     assert [str(item.value) for item in app.exception] == []
 
 
