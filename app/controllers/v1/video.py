@@ -258,6 +258,17 @@ def create_task(
                 body.font_name or "STHeitiMedium.ttc",
                 request_id,
             )
+        if (
+            stop_at == "video"
+            and isinstance(body, TaskVideoRequest)
+            and body.logo_material
+        ):
+            # Same directory boundary as the renderer: an unknown, non-image or
+            # out-of-directory logo is rejected (400) before any paid work starts.
+            try:
+                tm.video.resolve_logo_path(body.logo_material)
+            except ValueError as exc:
+                raise ValueError(f"invalid logo material: {exc}") from exc
         task = {
             "task_id": task_id,
             "request_id": request_id,
