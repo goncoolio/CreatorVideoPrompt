@@ -794,6 +794,45 @@ def _open_image_clip_with_fallback(image_path: str):
 _moviepy_reader_open_lock = threading.Lock()
 
 
+def resolve_logo_path(logo_material: str) -> str:
+    """Resolve a brand logo uploaded through /video_materials (images only).
+
+    The name comes from API parameters, so it must stay inside the local
+    materials directory, like local video materials.
+    """
+    local_videos_dir = utils.storage_dir("local_videos", create=True)
+    logo_path = file_security.resolve_path_within_directory(local_videos_dir, logo_material)
+    if utils.parse_extension(logo_path) not in const.FILE_TYPE_IMAGES:
+        raise ValueError("logo must be an image material")
+    return logo_path
+
+
+def logo_overlay_box(
+    video_width: int,
+    video_height: int,
+    logo_width: int,
+    logo_height: int,
+    position: str,
+    width_ratio: float,
+) -> tuple[int, int, int, int]:
+    """Return (x, y, width, height) of the logo on the canvas.
+
+    The logo keeps its aspect ratio, is sized from the video width and never
+    exceeds a quarter of the height; it sits in a corner with a margin of 4 %
+    of the shorter side so it stays clear of the platform UI edges.
+    """
+    target_width = max(1, int(round(video_width * width_ratio)))
+    target_height = max(1, int(round(target_width * logo_height / max(1, logo_width))))
+    max_height = max(1, int(video_height * 0.25))
+    if target_height > max_height:
+        target_width = max(1, int(round(target_width * max_height / target_height)))
+        target_height = max_height
+    margin = int(round(min(video_width, video_height) * 0.04))
+    x = margin if position.endswith("left") else video_width - target_width - margin
+    y = margin if position.startswith("top") else video_height - target_height - margin
+    return x, y, target_width, target_height
+
+
 def _open_video_clip_quietly(video_path: str, audio: bool = False) -> VideoFileClip:
     """
     安静地打开视频文件，避免 MoviePy 2.1.x 把 ffmpeg 探测信息直接打印到 stdout。
@@ -1938,6 +1977,26 @@ def generate_video(
             video_clip = CompositeVideoClip(
                 [video_clip, *text_clips], bg_color=(0, 0, 0)
             )
+            clip_stack.callback(video_clip.close)
+
+        if params.logo_material:
+            # The logo is composited above the subtitles for the whole video.
+            logo_path = resolve_logo_path(params.logo_material)
+            logo_source, _ = _open_image_clip_with_fallback(logo_path)
+            clip_stack.callback(logo_source.close)
+            position = getattr(params.logo_position, "value", params.logo_position)
+            # Size from the composed frame itself (already at the target aspect).
+            x, y, logo_width, logo_height = logo_overlay_box(
+                video_clip.w, video_clip.h, logo_source.w, logo_source.h, position, params.logo_width_ratio
+            )
+            logo_clip = (
+                logo_source.resized((logo_width, logo_height))
+                .with_opacity(params.logo_opacity)
+                .with_duration(video_clip.duration)
+                .with_position((x, y))
+            )
+            logger.info(f"  ⑥ logo: {params.logo_material} at {position} ({logo_width}x{logo_height})")
+            video_clip = CompositeVideoClip([video_clip, logo_clip], bg_color=(0, 0, 0))
             clip_stack.callback(video_clip.close)
 
         bgm_enabled = bgm_service.should_use_bgm(

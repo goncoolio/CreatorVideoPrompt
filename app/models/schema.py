@@ -58,6 +58,13 @@ class ImageMotion(str, Enum):
     zoom = "zoom"
 
 
+class LogoPosition(str, Enum):
+    top_left = "top_left"
+    top_right = "top_right"
+    bottom_left = "bottom_left"
+    bottom_right = "bottom_right"
+
+
 SubtitleDisplayMode = Literal["sentence", "word_by_word"]
 SubtitleAnimation = Literal["none", "pop_spring"]
 _SUBTITLE_DISPLAY_MODES = ("sentence", "word_by_word")
@@ -167,6 +174,14 @@ class VideoParams(BaseModel):
     paragraph_number: int = Field(default=1, ge=1, le=10)
     video_script_prompt: str = Field(default="", max_length=2000)
     custom_system_prompt: str = Field(default="", max_length=8000)
+
+    # Brand logo burned into every frame. `logo_material` is the stored name
+    # returned by POST /video_materials (an image), resolved inside the local
+    # materials directory exactly like local video materials.
+    logo_material: Optional[str] = Field(default=None, max_length=255)
+    logo_position: LogoPosition = LogoPosition.top_right
+    logo_width_ratio: float = Field(default=0.15, ge=0.05, le=0.4, allow_inf_nan=False)
+    logo_opacity: float = Field(default=0.9, ge=0.1, le=1.0, allow_inf_nan=False)
 
 
 class SubtitleRequest(BaseModel):
